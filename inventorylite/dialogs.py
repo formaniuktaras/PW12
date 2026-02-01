@@ -63,8 +63,26 @@ def product_prompt(
     dlg = tk.Toplevel()
     dlg.title(title)
     dlg.grab_set()
-    dlg.columnconfigure(1, weight=1)
-    dlg.columnconfigure(2, weight=0)
+    dlg.rowconfigure(0, weight=1)
+    dlg.columnconfigure(0, weight=1)
+
+    main = ttk.Frame(dlg)
+    main.grid(row=0, column=0, sticky="nsew")
+    main.columnconfigure(0, weight=3)
+    main.columnconfigure(2, weight=2)
+    main.rowconfigure(0, weight=1)
+
+    left = ttk.Frame(main)
+    left.grid(row=0, column=0, sticky="nsew", padx=(8, 6), pady=8)
+    left.columnconfigure(0, weight=0)
+    left.columnconfigure(1, weight=1)
+
+    ttk.Separator(main, orient="vertical").grid(row=0, column=1, sticky="ns")
+
+    right = ttk.Frame(main)
+    right.grid(row=0, column=2, sticky="nsew", padx=(6, 8), pady=8)
+    right.columnconfigure(0, weight=1)
+    right.rowconfigure(1, weight=1)
 
     images_service = ProductImagesService()
     session_id = uuid.uuid4().hex
@@ -100,17 +118,16 @@ def product_prompt(
 
     palette = _palette()
 
-    photo_frame = ttk.Frame(dlg)
-    photo_frame.grid(row=0, column=2, rowspan=11, padx=(12, 6), pady=6, sticky="nsew")
+    photo_frame = right
     photo_frame.columnconfigure(0, weight=1)
     photo_frame.rowconfigure(1, weight=1)
 
     ttk.Label(photo_frame, text="Фото").grid(row=0, column=0, sticky="w", padx=4, pady=(0, 6))
 
-    preview_container = tk.Frame(photo_frame, background=palette["surface_alt"], highlightthickness=1, width=360, height=240)
+    preview_container = tk.Frame(photo_frame, background=palette["surface_alt"], highlightthickness=1)
     preview_container.configure(highlightbackground=palette["border"], highlightcolor=palette["border"])
     preview_container.grid(row=1, column=0, sticky="nsew", padx=4)
-    preview_container.grid_propagate(False)
+    preview_container.minsize(260, 200)
     preview_container.columnconfigure(0, weight=1)
     preview_container.rowconfigure(0, weight=1)
 
@@ -119,7 +136,7 @@ def product_prompt(
         text="Немає фото",
         background=palette["surface_alt"],
         foreground=palette["muted"],
-        anchor="center",
+        anchor="n",
     )
     preview_label.grid(row=0, column=0, sticky="nsew")
 
@@ -133,16 +150,15 @@ def product_prompt(
     thumb_scroll = ttk.Scrollbar(photo_frame, orient="horizontal", command=thumb_canvas.xview)
     thumb_canvas.configure(xscrollcommand=thumb_scroll.set)
     thumb_canvas.grid(row=2, column=0, sticky="ew", padx=4, pady=(6, 2))
-    thumb_scroll.grid(row=3, column=0, sticky="ew", padx=4)
+    # Scrollbar intentionally not gridded to match Ceramic layout.
 
     thumbs_inner = tk.Frame(thumb_canvas, background=palette["bg"])
     thumb_canvas.create_window((0, 0), window=thumbs_inner, anchor="nw")
 
-    action_row = ttk.Frame(photo_frame)
-    action_row.grid(row=4, column=0, sticky="ew", padx=4, pady=(6, 0))
-
     preview_photo: ImageTk.PhotoImage | None = None
     thumbnail_cache: dict[str, ImageTk.PhotoImage] = {}
+    photo_tree: ttk.Treeview | None = None
+    photo_tree_syncing = False
 
     def _combined_images() -> list[dict]:
         combined = [img for img in existing_images if img["id"] not in deleted_image_ids]
@@ -166,6 +182,24 @@ def product_prompt(
             primary_ref["id"] = combined[0]["id"]
         else:
             primary_ref["filename"] = combined[0]["filename"]
+
+    def _refresh_photo_tree() -> None:
+        nonlocal photo_tree_syncing
+        if photo_tree is None:
+            return
+        combined = _combined_images()
+        photo_tree_syncing = True
+        photo_tree.delete(*photo_tree.get_children())
+        for idx, img in enumerate(combined):
+            name = Path(img.get("path") or img.get("filename") or "").name
+            primary_mark = "✓" if img.get("is_primary") else ""
+            photo_tree.insert("", "end", iid=str(idx), values=(name, primary_mark))
+        if selected_index is not None and combined:
+            idx = max(0, min(selected_index, len(combined) - 1))
+            photo_tree.selection_set(str(idx))
+            photo_tree.focus(str(idx))
+            photo_tree.see(str(idx))
+        photo_tree_syncing = False
 
     def _current_image() -> dict | None:
         combined = _combined_images()
@@ -199,8 +233,8 @@ def product_prompt(
             preview_photo = None
             return
         preview_label.configure(text="")
-        target_w = max(preview_label.winfo_width(), 1)
-        target_h = max(preview_label.winfo_height(), 1)
+        target_w = max(preview_container.winfo_width(), 1)
+        target_h = max(preview_container.winfo_height(), 1)
         try:
             with Image.open(img["path"]) as source:
                 source.thumbnail((target_w, target_h), Image.Resampling.LANCZOS)
@@ -276,6 +310,7 @@ def product_prompt(
         thumbs_inner.update_idletasks()
         thumb_canvas.configure(scrollregion=thumb_canvas.bbox("all"))
         _render_preview(_current_image())
+        _refresh_photo_tree()
 
     def _set_primary() -> None:
         nonlocal primary_ref
@@ -362,11 +397,21 @@ def product_prompt(
     preview_label.bind("<Double-Button-1>", _open_selected_preview)
     preview_label.bind("<Configure>", _on_preview_resize)
 
-    ttk.Button(action_row, text="＋ Додати", command=_add_images).pack(side=tk.LEFT, padx=4)
-    ttk.Button(action_row, text="Видалити", command=_delete_selected, style="Danger.TButton").pack(
-        side=tk.LEFT, padx=4
-    )
-    ttk.Button(action_row, text="Зробити основним", command=_set_primary).pack(side=tk.LEFT, padx=4)
+    def _on_thumb_wheel(event: tk.Event) -> None:
+        delta = 0
+        if hasattr(event, "delta") and event.delta:
+            delta = -1 * int(event.delta / 120)
+        elif event.num == 4:
+            delta = -1
+        elif event.num == 5:
+            delta = 1
+        if delta:
+            thumb_canvas.xview_scroll(delta, "units")
+
+    thumb_canvas.bind("<MouseWheel>", _on_thumb_wheel)
+    thumb_canvas.bind("<Shift-MouseWheel>", _on_thumb_wheel)
+    thumb_canvas.bind("<Button-4>", _on_thumb_wheel)
+    thumb_canvas.bind("<Button-5>", _on_thumb_wheel)
 
     def _handle_key(event: tk.Event) -> None:
         nonlocal selected_index
@@ -416,33 +461,45 @@ def product_prompt(
 
     _refresh_thumbnails()
 
-    ttk.Label(dlg, text="Артикул (SKU)").grid(row=0, column=0, padx=6, pady=4, sticky="w")
+    row = 0
+    ttk.Label(left, text="Артикул (SKU)").grid(row=row, column=0, padx=6, pady=4, sticky="w")
     sku_var = tk.StringVar(value=normalized_initial.get("sku", ""))
-    sku_frame = ttk.Frame(dlg)
-    sku_frame.grid(row=0, column=1, padx=6, pady=4, sticky="ew")
+    sku_frame = ttk.Frame(left)
+    sku_frame.grid(row=row, column=1, padx=6, pady=4, sticky="ew")
     sku_frame.columnconfigure(0, weight=1)
     ttk.Entry(sku_frame, textvariable=sku_var, width=30).grid(row=0, column=0, padx=(0, 4), pady=0, sticky="ew")
     generate_btn = ttk.Button(sku_frame, text="Згенерувати")
     generate_btn.grid(row=0, column=1, padx=0, pady=0)
 
-    ttk.Label(dlg, text="Артикул постачальника (legacy)").grid(row=1, column=0, padx=6, pady=4, sticky="w")
+    row += 1
+    ttk.Label(left, text="Артикул постачальника (legacy)").grid(row=row, column=0, padx=6, pady=4, sticky="w")
     supplier_sku_var = tk.StringVar(value=normalized_initial.get("supplier_sku", ""))
-    ttk.Entry(dlg, textvariable=supplier_sku_var, width=30).grid(row=1, column=1, padx=6, pady=4, sticky="ew")
+    ttk.Entry(left, textvariable=supplier_sku_var, width=30).grid(row=row, column=1, padx=6, pady=4, sticky="ew")
 
-    ttk.Label(dlg, text="Назва").grid(row=2, column=0, padx=6, pady=4, sticky="w")
+    row += 1
+    ttk.Label(left, text="Назва").grid(row=row, column=0, padx=6, pady=4, sticky="w")
     name_var = tk.StringVar(value=normalized_initial.get("name", ""))
-    ttk.Entry(dlg, textvariable=name_var, width=30).grid(row=2, column=1, padx=6, pady=4, sticky="ew")
+    ttk.Entry(left, textvariable=name_var, width=30).grid(row=row, column=1, padx=6, pady=4, sticky="ew")
 
-    ttk.Label(dlg, text="Бренд").grid(row=3, column=0, padx=6, pady=4, sticky="w")
+    row += 1
+    ttk.Label(left, text="Бренд").grid(row=row, column=0, padx=6, pady=4, sticky="w")
     brand_var = tk.StringVar()
     brand_names = [b["name"] for b in brands]
-    brand_combo = ttk.Combobox(dlg, textvariable=brand_var, state="readonly", values=brand_names)
-    brand_combo.grid(row=3, column=1, padx=6, pady=4, sticky="ew")
+    brand_combo = ttk.Combobox(left, textvariable=brand_var, state="readonly", values=brand_names)
+    brand_combo.grid(row=row, column=1, padx=6, pady=4, sticky="ew")
 
-    ttk.Label(dlg, text="Головна категорія").grid(row=4, column=0, padx=6, pady=4, sticky="w")
+    row += 1
+    ttk.Label(left, text="Одиниця").grid(row=row, column=0, padx=6, pady=4, sticky="w")
+    unit_var = tk.StringVar(value=normalized_initial.get("unit", "pcs"))
+    unit_values = ["шт.", "pcs", "уп.", "м", "кг"]
+    unit_combo = ttk.Combobox(left, textvariable=unit_var, values=unit_values, state="normal", width=12)
+    unit_combo.grid(row=row, column=1, padx=6, pady=4, sticky="w")
+
+    row += 1
+    ttk.Label(left, text="Головна категорія").grid(row=row, column=0, padx=6, pady=4, sticky="w")
     category_var = tk.StringVar()
-    category_combo = ttk.Combobox(dlg, textvariable=category_var, values=[c["label"] for c in categories])
-    category_combo.grid(row=4, column=1, padx=6, pady=4, sticky="ew")
+    category_combo = ttk.Combobox(left, textvariable=category_var, values=[c["label"] for c in categories])
+    category_combo.grid(row=row, column=1, padx=6, pady=4, sticky="ew")
 
     generator_enabled = bool(settings.get("defaults", "product", "sku_generator", "enabled") if settings else False)
 
@@ -480,49 +537,112 @@ def product_prompt(
 
     category_combo.bind("<KeyRelease>", refresh_category_options)
 
-    ttk.Label(dlg, text="Додаткові категорії").grid(row=5, column=0, padx=6, pady=4, sticky="nw")
-    extras_frame = ttk.Frame(dlg)
-    extras_frame.grid(row=5, column=1, padx=6, pady=4, sticky="nsew")
-    extras_frame.columnconfigure(0, weight=1)
-    extras_frame.rowconfigure(1, weight=1)
-    extras_search_var = tk.StringVar()
-    ttk.Entry(extras_frame, textvariable=extras_search_var).grid(
-        row=0, column=0, columnspan=2, padx=(0, 8), pady=(0, 4), sticky="ew"
-    )
-    extras_box = tk.Listbox(
-        extras_frame, selectmode=tk.MULTIPLE, height=min(10, max(6, len(categories))), exportselection=False
-    )
-    extras_scroll = ttk.Scrollbar(extras_frame, orient="vertical", command=extras_box.yview)
-    extras_box.configure(yscrollcommand=extras_scroll.set)
-    extras_box.grid(row=1, column=0, sticky="nsew")
-    extras_scroll.grid(row=1, column=1, sticky="ns")
+    row += 1
+    ttk.Label(left, text="Додаткові категорії").grid(row=row, column=0, padx=6, pady=4, sticky="nw")
+    extras_row = ttk.Frame(left)
+    extras_row.grid(row=row, column=1, padx=6, pady=4, sticky="ew")
+    extras_row.columnconfigure(0, weight=1)
 
-    filtered_extra_categories = list(categories)
-    initial_extra_ids = set(normalized_initial.get("extras") or [])
+    style = ttk.Style()
+    style.configure("Chip.TButton", padding=(10, 2))
 
-    def refresh_extra_list(*_args):
-        selected_labels = {extras_box.get(i) for i in extras_box.curselection()}
-        search = extras_search_var.get().strip().lower()
-        extras_box.delete(0, tk.END)
-        filtered_extra_categories.clear()
-        filtered_extra_categories.extend([c for c in categories if search in c["label"].lower()])
-        for idx, cat in enumerate(filtered_extra_categories):
-            extras_box.insert(tk.END, cat["label"])
-            if cat["label"] in selected_labels or cat["id"] in initial_extra_ids:
-                extras_box.selection_set(idx)
-        initial_extra_ids.difference_update({c["id"] for c in filtered_extra_categories})
+    extras_chips_frame = ttk.Frame(extras_row)
+    extras_chips_frame.grid(row=0, column=0, sticky="ew")
 
-    extras_search_var.trace_add("write", refresh_extra_list)
-    refresh_extra_list()
+    extras_selected_ids: set[int] = set(normalized_initial.get("extras") or [])
 
-    dlg.rowconfigure(5, weight=1)
+    def _remove_extra(extra_id: int) -> None:
+        extras_selected_ids.discard(extra_id)
+        render_extras_chips()
 
-    ttk.Label(dlg, text="Одиниця").grid(row=6, column=0, padx=6, pady=4, sticky="w")
-    unit_var = tk.StringVar(value=normalized_initial.get("unit", "pcs"))
-    ttk.Entry(dlg, textvariable=unit_var, width=12).grid(row=6, column=1, padx=6, pady=4, sticky="w")
+    def render_extras_chips() -> None:
+        for child in extras_chips_frame.winfo_children():
+            child.destroy()
+        if not extras_selected_ids:
+            ttk.Label(extras_chips_frame, text="Немає").pack(side=tk.LEFT, padx=2, pady=2)
+            return
+        for cat_id in sorted(extras_selected_ids):
+            label = next((c["label"] for c in categories if c["id"] == cat_id), str(cat_id))
+            chip = ttk.Button(
+                extras_chips_frame,
+                text=f"{label}  ×",
+                style="Chip.TButton",
+                command=lambda cid=cat_id: _remove_extra(cid),
+            )
+            chip.pack(side=tk.LEFT, padx=2, pady=2)
 
+    def open_extras_dialog() -> None:
+        extras_dlg = tk.Toplevel(dlg)
+        extras_dlg.title("Додаткові категорії")
+        extras_dlg.grab_set()
+        extras_dlg.configure(background=palette["bg"])
+        extras_dlg.columnconfigure(0, weight=1)
+        extras_dlg.rowconfigure(1, weight=1)
+
+        search_var = tk.StringVar()
+        search_frame = ttk.Frame(extras_dlg)
+        search_frame.grid(row=0, column=0, padx=8, pady=(8, 4), sticky="ew")
+        search_frame.columnconfigure(1, weight=1)
+        ttk.Label(search_frame, text="Пошук").grid(row=0, column=0, padx=(0, 6), sticky="w")
+        search_entry = ttk.Entry(search_frame, textvariable=search_var)
+        search_entry.grid(row=0, column=1, sticky="ew")
+
+        list_frame = ttk.Frame(extras_dlg)
+        list_frame.grid(row=1, column=0, padx=8, pady=4, sticky="nsew")
+        list_frame.columnconfigure(0, weight=1)
+        list_frame.rowconfigure(0, weight=1)
+
+        listbox = tk.Listbox(list_frame, selectmode=tk.MULTIPLE, exportselection=False, height=12)
+        scroll = ttk.Scrollbar(list_frame, orient="vertical", command=listbox.yview)
+        listbox.configure(yscrollcommand=scroll.set)
+        listbox.grid(row=0, column=0, sticky="nsew")
+        scroll.grid(row=0, column=1, sticky="ns")
+
+        filtered: list[dict] = []
+
+        def refresh_list(*_args) -> None:
+            search = search_var.get().strip().lower()
+            listbox.delete(0, tk.END)
+            filtered.clear()
+            filtered.extend([c for c in categories if search in c["label"].lower()])
+            for idx, cat in enumerate(filtered):
+                listbox.insert(tk.END, cat["label"])
+                if cat["id"] in extras_selected_ids:
+                    listbox.selection_set(idx)
+
+        def on_add() -> None:
+            extras_selected_ids.clear()
+            extras_selected_ids.update({filtered[i]["id"] for i in listbox.curselection()})
+            render_extras_chips()
+            extras_dlg.destroy()
+
+        def on_cancel() -> None:
+            extras_dlg.destroy()
+
+        search_var.trace_add("write", refresh_list)
+        refresh_list()
+
+        btns = ttk.Frame(extras_dlg)
+        btns.grid(row=2, column=0, padx=8, pady=(0, 8), sticky="e")
+        ttk.Button(btns, text="Додати", command=on_add).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="Скасувати", command=on_cancel).pack(side=tk.LEFT, padx=4)
+        extras_dlg.bind("<Return>", lambda _e: on_add())
+        extras_dlg.bind("<Escape>", lambda _e: on_cancel())
+
+    extras_add_btn = ttk.Button(extras_row, text="+", width=3, command=open_extras_dialog)
+    extras_add_btn.grid(row=0, column=1, sticky="e", padx=(6, 0))
+    render_extras_chips()
+
+    row += 1
     is_active_var = tk.BooleanVar(value=normalized_initial.get("is_active", True))
-    ttk.Checkbutton(dlg, text="Активний", variable=is_active_var).grid(row=7, column=1, padx=6, pady=4, sticky="w")
+    ttk.Checkbutton(left, text="Активний", variable=is_active_var).grid(
+        row=row, column=1, padx=6, pady=4, sticky="w"
+    )
+
+    row += 1
+    notebook = ttk.Notebook(left)
+    notebook.grid(row=row, column=0, columnspan=2, sticky="nsew", pady=(10, 0))
+    left.rowconfigure(row, weight=1)
 
     suppliers = db.list_suppliers()
     supplier_names = [s["name"] for s in suppliers]
@@ -540,7 +660,9 @@ def product_prompt(
         except (TypeError, ValueError):
             continue
 
-    barcode_prefix = _sanitize_barcode_prefix((settings.get("defaults", "product", "barcode_prefix") if settings else "") or "")
+    barcode_prefix = _sanitize_barcode_prefix(
+        (settings.get("defaults", "product", "barcode_prefix") if settings else "") or ""
+    )
     barcodes_state: list[dict] = []
     for code in normalized_initial.get("barcodes") or []:
         raw = (code.get("code") or "").strip()
@@ -548,28 +670,15 @@ def product_prompt(
             continue
         barcodes_state.append({"code": raw, "note": (code.get("note") or "").strip()})
 
-    supplier_codes_frame = ttk.LabelFrame(dlg, text="Артикули постачальників")
-    supplier_codes_frame.grid(row=8, column=0, columnspan=2, padx=6, pady=4, sticky="nsew")
-    supplier_codes_frame.columnconfigure(1, weight=1)
-    dlg.rowconfigure(8, weight=1)
+    supplier_tab = ttk.Frame(notebook)
+    barcode_tab = ttk.Frame(notebook)
+    photo_tab = ttk.Frame(notebook)
+    notebook.add(supplier_tab, text="Постачальники")
+    notebook.add(barcode_tab, text="Штрихкоди")
+    notebook.add(photo_tab, text="Фото")
 
-    ttk.Label(supplier_codes_frame, text="Постачальник:").grid(row=0, column=0, padx=4, pady=2, sticky="w")
-    supplier_var = tk.StringVar()
-    supplier_combo = ttk.Combobox(
-        supplier_codes_frame, textvariable=supplier_var, state="readonly", values=supplier_names, width=30
-    )
-    supplier_combo.grid(row=0, column=1, padx=4, pady=2, sticky="ew")
-
-    ttk.Label(supplier_codes_frame, text="Артикул:").grid(row=1, column=0, padx=4, pady=2, sticky="w")
-    supplier_code_var = tk.StringVar()
-    ttk.Entry(supplier_codes_frame, textvariable=supplier_code_var, width=30).grid(
-        row=1, column=1, padx=4, pady=2, sticky="ew"
-    )
-
-    supplier_primary_var = tk.BooleanVar(value=False)
-    ttk.Checkbutton(supplier_codes_frame, text="Основний", variable=supplier_primary_var).grid(
-        row=1, column=2, padx=4, pady=2, sticky="w"
-    )
+    supplier_tab.columnconfigure(0, weight=1)
+    supplier_tab.rowconfigure(0, weight=1)
 
     def refresh_supplier_codes_tree() -> None:
         supplier_codes_tree.delete(*supplier_codes_tree.get_children())
@@ -579,28 +688,18 @@ def product_prompt(
                 "",
                 "end",
                 iid=str(idx),
-                values=(supplier_name, code.get("supplier_sku", ""), "Так" if code.get("is_primary") else ""),
+                values=(supplier_name, code.get("supplier_sku", ""), "✓" if code.get("is_primary") else ""),
             )
 
-    def add_supplier_code() -> None:
-        if not supplier_names:
-            messagebox.showerror("Артикули постачальників", "Створіть постачальника зі статусом постачальника.")
-            return
-        try:
-            supplier_idx = supplier_names.index(supplier_var.get())
-        except ValueError:
-            messagebox.showerror("Артикули постачальників", "Оберіть постачальника")
-            return
-        supplier_id = suppliers[supplier_idx]["id"]
-        supplier_sku = supplier_code_var.get().strip()
+    def add_supplier_code_from_values(supplier_id: int, supplier_sku: str, is_primary: bool) -> bool:
+        supplier_sku = supplier_sku.strip()
         if not supplier_sku:
             messagebox.showerror("Артикули постачальників", "Введіть артикул постачальника")
-            return
+            return False
         key = (supplier_id, supplier_sku.lower())
         if any((c.get("supplier_id"), (c.get("supplier_sku") or "").lower()) == key for c in supplier_codes_state):
             messagebox.showerror("Артикули постачальників", "Такий артикул вже додано для цього постачальника")
-            return
-        is_primary = bool(supplier_primary_var.get())
+            return False
         if is_primary:
             for c in supplier_codes_state:
                 if c.get("supplier_id") == supplier_id:
@@ -609,8 +708,46 @@ def product_prompt(
             {"supplier_id": supplier_id, "supplier_sku": supplier_sku, "is_primary": is_primary}
         )
         refresh_supplier_codes_tree()
-        supplier_code_var.set("")
-        supplier_primary_var.set(False)
+        return True
+
+    def open_add_supplier_dialog() -> None:
+        if not supplier_names:
+            messagebox.showerror("Артикули постачальників", "Створіть постачальника зі статусом постачальника.")
+            return
+        add_dlg = tk.Toplevel(dlg)
+        add_dlg.title("Додати постачальника")
+        add_dlg.grab_set()
+
+        ttk.Label(add_dlg, text="Постачальник").grid(row=0, column=0, padx=8, pady=6, sticky="w")
+        supplier_var = tk.StringVar(value=supplier_names[0])
+        supplier_combo = ttk.Combobox(add_dlg, textvariable=supplier_var, state="readonly", values=supplier_names)
+        supplier_combo.grid(row=0, column=1, padx=8, pady=6, sticky="ew")
+
+        ttk.Label(add_dlg, text="Артикул").grid(row=1, column=0, padx=8, pady=6, sticky="w")
+        supplier_sku_var = tk.StringVar()
+        ttk.Entry(add_dlg, textvariable=supplier_sku_var).grid(row=1, column=1, padx=8, pady=6, sticky="ew")
+
+        primary_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(add_dlg, text="Основний", variable=primary_var).grid(
+            row=2, column=1, padx=8, pady=4, sticky="w"
+        )
+
+        def on_add() -> None:
+            try:
+                supplier_idx = supplier_names.index(supplier_var.get())
+            except ValueError:
+                messagebox.showerror("Артикули постачальників", "Оберіть постачальника")
+                return
+            supplier_id = suppliers[supplier_idx]["id"]
+            if add_supplier_code_from_values(supplier_id, supplier_sku_var.get(), bool(primary_var.get())):
+                add_dlg.destroy()
+
+        btns = ttk.Frame(add_dlg)
+        btns.grid(row=3, column=0, columnspan=2, padx=8, pady=(0, 8), sticky="e")
+        ttk.Button(btns, text="Додати", command=on_add).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="Скасувати", command=add_dlg.destroy).pack(side=tk.LEFT, padx=4)
+        add_dlg.bind("<Return>", lambda _e: on_add())
+        add_dlg.bind("<Escape>", lambda _e: add_dlg.destroy())
 
     def delete_supplier_code() -> None:
         selection = supplier_codes_tree.selection()
@@ -633,79 +770,79 @@ def product_prompt(
                     code["is_primary"] = i == idx
         refresh_supplier_codes_tree()
 
-    ttk.Button(supplier_codes_frame, text="Додати", command=add_supplier_code).grid(
-        row=0, column=2, padx=4, pady=2, sticky="w"
-    )
-
-    columns = ("supplier", "sku", "primary")
     supplier_codes_tree = ttk.Treeview(
-        supplier_codes_frame, columns=columns, show="headings", selectmode="browse", height=6
+        supplier_tab, columns=("supplier", "sku", "primary"), show="headings", selectmode="browse", height=6
     )
     supplier_codes_tree.heading("supplier", text="Постачальник")
     supplier_codes_tree.heading("sku", text="Артикул")
     supplier_codes_tree.heading("primary", text="Основний")
-    supplier_codes_tree.column("supplier", width=180, anchor="w")
-    supplier_codes_tree.column("sku", width=120, anchor="w")
+    supplier_codes_tree.column("supplier", width=200, anchor="w")
+    supplier_codes_tree.column("sku", width=140, anchor="w")
     supplier_codes_tree.column("primary", width=90, anchor="center")
-    supplier_codes_tree.grid(row=2, column=0, columnspan=3, padx=4, pady=4, sticky="nsew")
-    supplier_codes_frame.rowconfigure(2, weight=1)
-    supplier_codes_frame.columnconfigure(0, weight=1)
-    supplier_codes_frame.columnconfigure(1, weight=1)
-    scroll = ttk.Scrollbar(supplier_codes_frame, orient="vertical", command=supplier_codes_tree.yview)
-    supplier_codes_tree.configure(yscrollcommand=scroll.set)
-    scroll.grid(row=2, column=3, sticky="ns")
+    supplier_codes_tree.grid(row=0, column=0, padx=4, pady=4, sticky="nsew")
+    supplier_scroll = ttk.Scrollbar(supplier_tab, orient="vertical", command=supplier_codes_tree.yview)
+    supplier_codes_tree.configure(yscrollcommand=supplier_scroll.set)
+    supplier_scroll.grid(row=0, column=1, sticky="ns")
 
-    actions_frame = ttk.Frame(supplier_codes_frame)
-    actions_frame.grid(row=3, column=0, columnspan=3, padx=4, pady=(0, 4), sticky="w")
-    ttk.Button(actions_frame, text="Видалити вибраний", command=delete_supplier_code).pack(side=tk.LEFT, padx=4)
-    ttk.Button(actions_frame, text="Зробити основним", command=mark_primary).pack(side=tk.LEFT, padx=4)
+    supplier_actions = ttk.Frame(supplier_tab)
+    supplier_actions.grid(row=1, column=0, padx=4, pady=(0, 4), sticky="w")
+    ttk.Button(supplier_actions, text="+ Додати", command=open_add_supplier_dialog).pack(side=tk.LEFT, padx=4)
+    ttk.Button(supplier_actions, text="Видалити", command=delete_supplier_code).pack(side=tk.LEFT, padx=4)
+    ttk.Button(supplier_actions, text="Зробити основним", command=mark_primary).pack(side=tk.LEFT, padx=4)
 
-    if supplier_names:
-        supplier_combo.current(0)
     refresh_supplier_codes_tree()
 
-    barcodes_frame = ttk.LabelFrame(dlg, text="Додаткові штрихкоди")
-    barcodes_frame.grid(row=9, column=0, columnspan=2, padx=6, pady=4, sticky="nsew")
-    barcodes_frame.columnconfigure(1, weight=1)
-    dlg.rowconfigure(9, weight=1)
+    barcode_tab.columnconfigure(0, weight=1)
+    barcode_tab.rowconfigure(1, weight=1)
 
     def _main_barcode_value() -> str:
         return f"{barcode_prefix}{sku_var.get().strip()}"
 
-    main_barcode_label = ttk.Label(barcodes_frame, text=f"Основний (SKU): {_main_barcode_value()}")
-    main_barcode_label.grid(row=0, column=0, columnspan=3, padx=4, pady=2, sticky="w")
+    main_barcode_label = ttk.Label(barcode_tab, text=f"Основний (SKU): {_main_barcode_value()}")
+    main_barcode_label.grid(row=0, column=0, padx=4, pady=(4, 0), sticky="w")
 
     def _update_main_barcode(*_args) -> None:
         main_barcode_label.configure(text=f"Основний (SKU): {_main_barcode_value()}")
 
     sku_var.trace_add("write", _update_main_barcode)
 
-    ttk.Label(barcodes_frame, text="Штрихкод:").grid(row=1, column=0, padx=4, pady=2, sticky="w")
-    barcode_code_var = tk.StringVar()
-    ttk.Entry(barcodes_frame, textvariable=barcode_code_var, width=22).grid(row=1, column=1, padx=4, pady=2, sticky="ew")
-
-    ttk.Label(barcodes_frame, text="Нотатка:").grid(row=2, column=0, padx=4, pady=2, sticky="w")
-    barcode_note_var = tk.StringVar()
-    ttk.Entry(barcodes_frame, textvariable=barcode_note_var, width=22).grid(row=2, column=1, padx=4, pady=2, sticky="ew")
-
     def refresh_barcode_tree() -> None:
         barcode_tree.delete(*barcode_tree.get_children())
         for idx, code in enumerate(barcodes_state):
             barcode_tree.insert("", "end", iid=str(idx), values=(code.get("code", ""), code.get("note", "")))
 
-    def add_barcode() -> None:
-        code_val = barcode_code_var.get().strip()
-        if not code_val:
-            messagebox.showerror("Штрихкоди", "Введіть штрихкод")
-            return
-        normalized = code_val.lower()
-        if any((c.get("code") or "").lower() == normalized for c in barcodes_state):
-            messagebox.showerror("Штрихкоди", "Такий штрихкод вже додано")
-            return
-        barcodes_state.append({"code": code_val, "note": barcode_note_var.get().strip()})
-        refresh_barcode_tree()
-        barcode_code_var.set("")
-        barcode_note_var.set("")
+    def open_add_barcode_dialog() -> None:
+        add_dlg = tk.Toplevel(dlg)
+        add_dlg.title("Додати штрихкод")
+        add_dlg.grab_set()
+
+        ttk.Label(add_dlg, text="Штрихкод").grid(row=0, column=0, padx=8, pady=6, sticky="w")
+        barcode_code_var = tk.StringVar()
+        ttk.Entry(add_dlg, textvariable=barcode_code_var).grid(row=0, column=1, padx=8, pady=6, sticky="ew")
+
+        ttk.Label(add_dlg, text="Нотатка").grid(row=1, column=0, padx=8, pady=6, sticky="w")
+        barcode_note_var = tk.StringVar()
+        ttk.Entry(add_dlg, textvariable=barcode_note_var).grid(row=1, column=1, padx=8, pady=6, sticky="ew")
+
+        def on_add() -> None:
+            code_val = barcode_code_var.get().strip()
+            if not code_val:
+                messagebox.showerror("Штрихкоди", "Введіть штрихкод")
+                return
+            normalized = code_val.lower()
+            if any((c.get("code") or "").lower() == normalized for c in barcodes_state):
+                messagebox.showerror("Штрихкоди", "Такий штрихкод вже додано")
+                return
+            barcodes_state.append({"code": code_val, "note": barcode_note_var.get().strip()})
+            refresh_barcode_tree()
+            add_dlg.destroy()
+
+        btns = ttk.Frame(add_dlg)
+        btns.grid(row=2, column=0, columnspan=2, padx=8, pady=(0, 8), sticky="e")
+        ttk.Button(btns, text="Додати", command=on_add).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="Скасувати", command=add_dlg.destroy).pack(side=tk.LEFT, padx=4)
+        add_dlg.bind("<Return>", lambda _e: on_add())
+        add_dlg.bind("<Escape>", lambda _e: add_dlg.destroy())
 
     def delete_barcode() -> None:
         selection = barcode_tree.selection()
@@ -716,35 +853,71 @@ def product_prompt(
             barcodes_state.pop(idx)
         refresh_barcode_tree()
 
-    ttk.Button(barcodes_frame, text="Додати", command=add_barcode).grid(row=1, column=2, padx=4, pady=2, sticky="w")
-
-    barcode_tree = ttk.Treeview(barcodes_frame, columns=("code", "note"), show="headings", selectmode="browse", height=5)
+    barcode_tree = ttk.Treeview(barcode_tab, columns=("code", "note"), show="headings", selectmode="browse", height=5)
     barcode_tree.heading("code", text="Штрихкод")
     barcode_tree.heading("note", text="Нотатка")
-    barcode_tree.column("code", width=180, anchor="w")
-    barcode_tree.column("note", width=180, anchor="w")
-    barcode_tree.grid(row=3, column=0, columnspan=3, padx=4, pady=4, sticky="nsew")
-    barcodes_frame.rowconfigure(3, weight=1)
-    barcodes_frame.columnconfigure(0, weight=1)
-    barcodes_frame.columnconfigure(1, weight=1)
-    barcode_scroll = ttk.Scrollbar(barcodes_frame, orient="vertical", command=barcode_tree.yview)
+    barcode_tree.column("code", width=220, anchor="w")
+    barcode_tree.column("note", width=220, anchor="w")
+    barcode_tree.grid(row=1, column=0, padx=4, pady=4, sticky="nsew")
+    barcode_scroll = ttk.Scrollbar(barcode_tab, orient="vertical", command=barcode_tree.yview)
     barcode_tree.configure(yscrollcommand=barcode_scroll.set)
-    barcode_scroll.grid(row=3, column=3, sticky="ns")
+    barcode_scroll.grid(row=1, column=1, sticky="ns")
 
-    ttk.Button(barcodes_frame, text="Видалити вибраний", command=delete_barcode).grid(
-        row=4, column=0, columnspan=3, padx=4, pady=(0, 4), sticky="w"
-    )
+    barcode_actions = ttk.Frame(barcode_tab)
+    barcode_actions.grid(row=2, column=0, padx=4, pady=(0, 4), sticky="w")
+    ttk.Button(barcode_actions, text="+ Додати", command=open_add_barcode_dialog).pack(side=tk.LEFT, padx=4)
+    ttk.Button(barcode_actions, text="Видалити", command=delete_barcode).pack(side=tk.LEFT, padx=4)
 
     refresh_barcode_tree()
+
+    photo_tab.columnconfigure(0, weight=1)
+    photo_tab.rowconfigure(0, weight=1)
+
+    photo_tree = ttk.Treeview(photo_tab, columns=("name", "primary"), show="headings", selectmode="browse", height=5)
+    photo_tree.heading("name", text="Фото")
+    photo_tree.heading("primary", text="Основне")
+    photo_tree.column("name", width=240, anchor="w")
+    photo_tree.column("primary", width=80, anchor="center")
+    photo_tree.grid(row=0, column=0, padx=4, pady=4, sticky="nsew")
+    photo_scroll = ttk.Scrollbar(photo_tab, orient="vertical", command=photo_tree.yview)
+    photo_tree.configure(yscrollcommand=photo_scroll.set)
+    photo_scroll.grid(row=0, column=1, sticky="ns")
+
+    def _on_photo_tree_select(_event=None) -> None:
+        nonlocal selected_index
+        if photo_tree_syncing:
+            return
+        selection = photo_tree.selection()
+        if not selection:
+            return
+        idx = int(selection[0])
+        if idx != selected_index:
+            selected_index = idx
+            _refresh_thumbnails()
+
+    def _on_photo_tree_open(_event=None) -> None:
+        current = _current_image()
+        if not current:
+            return
+        _open_file(Path(current["path"]))
+
+    photo_tree.bind("<<TreeviewSelect>>", _on_photo_tree_select)
+    photo_tree.bind("<Double-1>", _on_photo_tree_open)
+
+    photo_actions = ttk.Frame(photo_tab)
+    photo_actions.grid(row=1, column=0, padx=4, pady=(0, 4), sticky="w")
+    ttk.Button(photo_actions, text="+ Додати", command=_add_images).pack(side=tk.LEFT, padx=4)
+    ttk.Button(photo_actions, text="Видалити", command=_delete_selected, style="Danger.TButton").pack(
+        side=tk.LEFT, padx=4
+    )
+    ttk.Button(photo_actions, text="Зробити основним", command=_set_primary).pack(side=tk.LEFT, padx=4)
+
+    _refresh_photo_tree()
 
     if initial:
         brand_combo.current(next((i for i, b in enumerate(brands) if b["id"] == normalized_initial["brand_id"]), 0))
         category_var.set(next((c["label"] for c in categories if c["id"] == normalized_initial["category_id"]), ""))
         refresh_category_options()
-        extras = set(normalized_initial.get("extras") or [])
-        for idx, cat in enumerate(filtered_extra_categories):
-            if cat["id"] in extras:
-                extras_box.selection_set(idx)
     else:
         preferred_brand = _find_index_by_name(brand_names, (settings.get("defaults", "product", "brand") if settings else ""))
         if preferred_brand is not None:
@@ -814,7 +987,7 @@ def product_prompt(
                 continue
             barcodes_payload.append({"code": value, "note": (code.get("note") or "").strip()})
 
-        extras_ids = [filtered_extra_categories[i]["id"] for i in extras_box.curselection()]
+        extras_ids = sorted(extras_selected_ids)
         _sync_primary_ref()
         image_payload = {
             "session_id": session_id,
@@ -840,9 +1013,12 @@ def product_prompt(
         images_service.cleanup_pending(session_id)
         dlg.destroy()
 
-    btns = ttk.Frame(dlg)
-    btns.grid(row=10, column=0, columnspan=2, pady=8)
-    ttk.Button(btns, text="OK", command=on_ok).pack(side=tk.LEFT, padx=4)
+    bottom = ttk.Frame(dlg)
+    bottom.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 8))
+    bottom.columnconfigure(0, weight=1)
+    btns = ttk.Frame(bottom)
+    btns.grid(row=0, column=1, sticky="e")
+    ttk.Button(btns, text="Зберегти", command=on_ok).pack(side=tk.LEFT, padx=4)
     ttk.Button(btns, text="Скасувати", command=on_cancel).pack(side=tk.LEFT, padx=4)
     dlg.bind("<Return>", lambda e: on_ok())
     dlg.bind("<Escape>", lambda e: on_cancel())
