@@ -2,3 +2,4 @@ pyinstaller
 openpyxl
 xlrd
 reportlab
+pillow

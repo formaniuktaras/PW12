@@ -1,14 +1,30 @@
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 import tkinter as tk
-from tkinter import ttk, messagebox
+from pathlib import Path
+from tkinter import ttk, messagebox, filedialog
 from typing import Optional
+import uuid
+
+from PIL import Image, ImageTk
 
 from inventorylite import db, sku_gen
 from inventorylite.helpers import _find_index_by_name, _sanitize_barcode_prefix
+from inventorylite.services.product_images_service import ProductImagesService
 from inventorylite.utils import Settings
 
-def product_prompt(brands, categories, title: str, initial=None, settings: Settings | None = None):
+def product_prompt(
+    brands,
+    categories,
+    title: str,
+    initial=None,
+    settings: Settings | None = None,
+    *,
+    product_id: int | None = None,
+):
     base_initial = {
         "sku": "",
         "supplier_sku": "",
@@ -48,6 +64,357 @@ def product_prompt(brands, categories, title: str, initial=None, settings: Setti
     dlg.title(title)
     dlg.grab_set()
     dlg.columnconfigure(1, weight=1)
+    dlg.columnconfigure(2, weight=0)
+
+    images_service = ProductImagesService()
+    session_id = uuid.uuid4().hex
+    deleted_image_ids: set[int] = set()
+    pending_images: list[dict] = []
+    existing_images: list[dict] = []
+    selected_index: int | None = None
+    primary_ref: dict | None = None
+
+    def _open_file(path: Path) -> None:
+        if not path.exists():
+            messagebox.showerror("Фото", "Файл не знайдено.")
+            return
+        try:
+            os.startfile(str(path))  # type: ignore[attr-defined]
+        except Exception:
+            if os.name == "nt":
+                return
+            cmd = "open" if sys.platform == "darwin" else "xdg-open"
+            subprocess.run([cmd, str(path)], check=False)
+
+    def _palette() -> dict[str, str]:
+        style = ttk.Style()
+        return {
+            "bg": style.lookup("TFrame", "background") or "#2b2b2b",
+            "surface": style.lookup("TLabel", "background") or "#2b2b2b",
+            "surface_alt": style.lookup("TEntry", "fieldbackground") or "#3a3a3a",
+            "text": style.lookup("TLabel", "foreground") or "#e6e6e6",
+            "muted": "#9aa0a6",
+            "border": "#4a4a4a",
+            "accent": "#3b82f6",
+        }
+
+    palette = _palette()
+
+    photo_frame = ttk.Frame(dlg)
+    photo_frame.grid(row=0, column=2, rowspan=11, padx=(12, 6), pady=6, sticky="nsew")
+    photo_frame.columnconfigure(0, weight=1)
+    photo_frame.rowconfigure(1, weight=1)
+
+    ttk.Label(photo_frame, text="Фото").grid(row=0, column=0, sticky="w", padx=4, pady=(0, 6))
+
+    preview_container = tk.Frame(photo_frame, background=palette["surface_alt"], highlightthickness=1, width=360, height=240)
+    preview_container.configure(highlightbackground=palette["border"], highlightcolor=palette["border"])
+    preview_container.grid(row=1, column=0, sticky="nsew", padx=4)
+    preview_container.grid_propagate(False)
+    preview_container.columnconfigure(0, weight=1)
+    preview_container.rowconfigure(0, weight=1)
+
+    preview_label = tk.Label(
+        preview_container,
+        text="Немає фото",
+        background=palette["surface_alt"],
+        foreground=palette["muted"],
+        anchor="center",
+    )
+    preview_label.grid(row=0, column=0, sticky="nsew")
+
+    thumb_canvas = tk.Canvas(
+        photo_frame,
+        height=110,
+        background=palette["bg"],
+        highlightthickness=0,
+        bd=0,
+    )
+    thumb_scroll = ttk.Scrollbar(photo_frame, orient="horizontal", command=thumb_canvas.xview)
+    thumb_canvas.configure(xscrollcommand=thumb_scroll.set)
+    thumb_canvas.grid(row=2, column=0, sticky="ew", padx=4, pady=(6, 2))
+    thumb_scroll.grid(row=3, column=0, sticky="ew", padx=4)
+
+    thumbs_inner = tk.Frame(thumb_canvas, background=palette["bg"])
+    thumb_canvas.create_window((0, 0), window=thumbs_inner, anchor="nw")
+
+    action_row = ttk.Frame(photo_frame)
+    action_row.grid(row=4, column=0, sticky="ew", padx=4, pady=(6, 0))
+
+    preview_photo: ImageTk.PhotoImage | None = None
+    thumbnail_cache: dict[str, ImageTk.PhotoImage] = {}
+
+    def _combined_images() -> list[dict]:
+        combined = [img for img in existing_images if img["id"] not in deleted_image_ids]
+        combined.extend(pending_images)
+        return combined
+
+    def _sync_primary_ref() -> None:
+        nonlocal primary_ref
+        if primary_ref and primary_ref.get("kind") == "existing":
+            if primary_ref.get("id") in deleted_image_ids:
+                primary_ref = None
+
+        combined = _combined_images()
+        if not combined:
+            primary_ref = None
+            return
+        if primary_ref:
+            return
+        primary_ref = {"kind": combined[0]["kind"]}
+        if combined[0]["kind"] == "existing":
+            primary_ref["id"] = combined[0]["id"]
+        else:
+            primary_ref["filename"] = combined[0]["filename"]
+
+    def _current_image() -> dict | None:
+        combined = _combined_images()
+        if selected_index is None or not combined:
+            return None
+        if selected_index < 0 or selected_index >= len(combined):
+            return None
+        return combined[selected_index]
+
+    def _apply_primary_flags() -> None:
+        _sync_primary_ref()
+        for img in existing_images:
+            img["is_primary"] = False
+        for img in pending_images:
+            img["is_primary"] = False
+        if not primary_ref:
+            return
+        if primary_ref.get("kind") == "existing":
+            for img in existing_images:
+                if img["id"] == primary_ref.get("id"):
+                    img["is_primary"] = True
+        elif primary_ref.get("kind") == "pending":
+            for img in pending_images:
+                if img["filename"] == primary_ref.get("filename"):
+                    img["is_primary"] = True
+
+    def _render_preview(img: dict | None) -> None:
+        nonlocal preview_photo
+        if not img or not img.get("path") or not Path(img["path"]).exists():
+            preview_label.configure(text="Немає фото", image="", compound="none")
+            preview_photo = None
+            return
+        preview_label.configure(text="")
+        target_w = max(preview_label.winfo_width(), 1)
+        target_h = max(preview_label.winfo_height(), 1)
+        try:
+            with Image.open(img["path"]) as source:
+                source.thumbnail((target_w, target_h), Image.Resampling.LANCZOS)
+                preview_photo = ImageTk.PhotoImage(source)
+                preview_label.configure(image=preview_photo)
+        except Exception:
+            preview_label.configure(text="Немає фото", image="", compound="none")
+            preview_photo = None
+
+    def _thumbnail_for(path: Path, size: int = 96) -> ImageTk.PhotoImage | None:
+        key = f"{path}:{size}"
+        if key in thumbnail_cache:
+            return thumbnail_cache[key]
+        try:
+            with Image.open(path) as image:
+                image.thumbnail((size - 8, size - 8), Image.Resampling.LANCZOS)
+                thumb = ImageTk.PhotoImage(image)
+                thumbnail_cache[key] = thumb
+                return thumb
+        except Exception:
+            return None
+
+    def _refresh_thumbnails() -> None:
+        nonlocal selected_index
+        for child in thumbs_inner.winfo_children():
+            child.destroy()
+        combined = _combined_images()
+        if selected_index is None and combined:
+            selected_index = 0
+        if combined and selected_index is not None:
+            selected_index = max(0, min(selected_index, len(combined) - 1))
+        _sync_primary_ref()
+        _apply_primary_flags()
+        for idx, img in enumerate(combined):
+            frame = tk.Frame(thumbs_inner, background=palette["bg"])
+            frame.grid(row=0, column=idx, padx=4, pady=4)
+            canvas = tk.Canvas(
+                frame,
+                width=96,
+                height=96,
+                background=palette["surface_alt"],
+                highlightthickness=2,
+                highlightbackground=palette["accent"] if idx == selected_index else palette["border"],
+                highlightcolor=palette["accent"],
+                bd=0,
+            )
+            canvas.pack()
+            thumb = _thumbnail_for(Path(img["path"]))
+            if thumb:
+                canvas.create_image(48, 48, image=thumb)
+                canvas.image = thumb
+            if img.get("is_primary"):
+                canvas.create_rectangle(62, 72, 92, 92, fill=palette["accent"], outline=palette["accent"])
+                canvas.create_text(77, 82, text="★", fill="#ffffff", font=("TkDefaultFont", 9, "bold"))
+
+            def _on_select(_event=None, index=idx):
+                nonlocal selected_index
+                selected_index = index
+                _refresh_thumbnails()
+                _render_preview(_current_image())
+
+            def _on_open(_event=None, index=idx):
+                selected = combined[index]
+                _open_file(Path(selected["path"]))
+
+            canvas.bind("<Button-1>", _on_select)
+            canvas.bind("<Double-Button-1>", _on_open)
+            canvas.bind("<Enter>", lambda _e, c=canvas: c.configure(highlightbackground=palette["accent"]))
+            canvas.bind("<Leave>", lambda _e, c=canvas, i=idx: c.configure(
+                highlightbackground=palette["accent"] if i == selected_index else palette["border"]
+            ))
+
+        thumbs_inner.update_idletasks()
+        thumb_canvas.configure(scrollregion=thumb_canvas.bbox("all"))
+        _render_preview(_current_image())
+
+    def _set_primary() -> None:
+        nonlocal primary_ref
+        current = _current_image()
+        if not current:
+            return
+        if current["kind"] == "existing":
+            primary_ref = {"kind": "existing", "id": current["id"]}
+        else:
+            primary_ref = {"kind": "pending", "filename": current["filename"]}
+        _refresh_thumbnails()
+
+    def _delete_selected() -> None:
+        nonlocal selected_index
+        current = _current_image()
+        if not current:
+            return
+        if messagebox.askyesno("Фото", "Видалити вибране фото?"):
+            if current["kind"] == "existing":
+                deleted_image_ids.add(current["id"])
+            else:
+                images_service.delete_pending_image(session_id, current["filename"])
+                pending_images[:] = [img for img in pending_images if img["filename"] != current["filename"]]
+            selected_index = None
+            _sync_primary_ref()
+            _refresh_thumbnails()
+
+    def _add_images() -> None:
+        nonlocal selected_index
+        file_paths = filedialog.askopenfilenames(
+            title="Додати фото",
+            filetypes=[("Images", "*.jpg *.jpeg *.png *.webp *.bmp"), ("All files", "*.*")],
+            initialdir=str(images_service.data_dir),
+        )
+        if not file_paths:
+            return
+        valid_paths: list[str] = []
+        for path in file_paths:
+            try:
+                with Image.open(path) as img:
+                    img.verify()
+            except Exception:
+                messagebox.showerror("Фото", f"Не вдалося відкрити файл: {Path(path).name}")
+                continue
+            valid_paths.append(path)
+        if not valid_paths:
+            return
+        combined = _combined_images()
+        max_sort = max((img.get("sort_order", 0) for img in combined), default=-1)
+        starting_sort = max_sort + 1
+        primary_if_empty = not combined
+        staged = images_service.stage_add_images(
+            product_id,
+            valid_paths,
+            session_id,
+            starting_sort=starting_sort,
+            primary_if_empty=primary_if_empty,
+        )
+        for item in staged:
+            pending_images.append(
+                {
+                    "kind": "pending",
+                    "filename": item.filename,
+                    "path": item.temp_path,
+                    "sort_order": item.sort_order,
+                    "is_primary": item.is_primary,
+                }
+            )
+        if primary_if_empty and staged:
+            primary_ref = {"kind": "pending", "filename": staged[0].filename}
+        if selected_index is None and staged:
+            selected_index = len(combined)
+        _refresh_thumbnails()
+
+    def _on_preview_resize(_event=None):
+        _render_preview(_current_image())
+
+    def _open_selected_preview(_event=None) -> None:
+        current = _current_image()
+        if not current:
+            return
+        _open_file(Path(current["path"]))
+
+    preview_label.bind("<Double-Button-1>", _open_selected_preview)
+    preview_label.bind("<Configure>", _on_preview_resize)
+
+    ttk.Button(action_row, text="＋ Додати", command=_add_images).pack(side=tk.LEFT, padx=4)
+    ttk.Button(action_row, text="Видалити", command=_delete_selected, style="Danger.TButton").pack(
+        side=tk.LEFT, padx=4
+    )
+    ttk.Button(action_row, text="Зробити основним", command=_set_primary).pack(side=tk.LEFT, padx=4)
+
+    def _handle_key(event: tk.Event) -> None:
+        nonlocal selected_index
+        combined = _combined_images()
+        if not combined:
+            return
+        if event.keysym in ("Left", "Right"):
+            if selected_index is None:
+                selected_index = 0
+            else:
+                delta = -1 if event.keysym == "Left" else 1
+                selected_index = max(0, min(selected_index + delta, len(combined) - 1))
+            _refresh_thumbnails()
+        elif event.keysym == "Delete":
+            _delete_selected()
+
+    dlg.bind("<Left>", _handle_key)
+    dlg.bind("<Right>", _handle_key)
+    dlg.bind("<Delete>", _handle_key)
+
+    if product_id:
+        for row in images_service.list_images(product_id):
+            abs_path = images_service.abs_path(row.rel_path)
+            existing_images.append(
+                {
+                    "kind": "existing",
+                    "id": row.id,
+                    "path": abs_path,
+                    "sort_order": row.sort_order,
+                    "is_primary": row.is_primary,
+                }
+            )
+        primary_row = next((img for img in existing_images if img["is_primary"]), None)
+        if primary_row:
+            primary_ref = {"kind": "existing", "id": primary_row["id"]}
+
+    for item in images_service.list_pending(session_id):
+        pending_images.append(
+            {
+                "kind": "pending",
+                "filename": item.filename,
+                "path": item.temp_path,
+                "sort_order": item.sort_order,
+                "is_primary": item.is_primary,
+            }
+        )
+
+    _refresh_thumbnails()
 
     ttk.Label(dlg, text="Артикул (SKU)").grid(row=0, column=0, padx=6, pady=4, sticky="w")
     sku_var = tk.StringVar(value=normalized_initial.get("sku", ""))
@@ -448,6 +815,12 @@ def product_prompt(brands, categories, title: str, initial=None, settings: Setti
             barcodes_payload.append({"code": value, "note": (code.get("note") or "").strip()})
 
         extras_ids = [filtered_extra_categories[i]["id"] for i in extras_box.curselection()]
+        _sync_primary_ref()
+        image_payload = {
+            "session_id": session_id,
+            "deleted_ids": sorted(deleted_image_ids),
+            "primary": primary_ref.copy() if primary_ref else None,
+        }
         result = (
             sku,
             supplier_sku_var.get().strip(),
@@ -459,10 +832,12 @@ def product_prompt(brands, categories, title: str, initial=None, settings: Setti
             extras_ids,
             supplier_codes_payload,
             barcodes_payload,
+            image_payload,
         )
         dlg.destroy()
 
     def on_cancel():
+        images_service.cleanup_pending(session_id)
         dlg.destroy()
 
     btns = ttk.Frame(dlg)
@@ -471,6 +846,7 @@ def product_prompt(brands, categories, title: str, initial=None, settings: Setti
     ttk.Button(btns, text="Скасувати", command=on_cancel).pack(side=tk.LEFT, padx=4)
     dlg.bind("<Return>", lambda e: on_ok())
     dlg.bind("<Escape>", lambda e: on_cancel())
+    dlg.protocol("WM_DELETE_WINDOW", on_cancel)
     dlg.wait_window()
     return result
 
