@@ -30,7 +30,7 @@ from inventorylite.text_norm import norm_text
 from inventorylite.utils import get_db_path
 
 
-LATEST_SCHEMA_VERSION = 4
+LATEST_SCHEMA_VERSION = 5
 
 
 def _strip_weird(value: str | None) -> str:
@@ -390,6 +390,20 @@ def init_db() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_pb_product_id ON ProductBarcodes(product_id);
             CREATE INDEX IF NOT EXISTS idx_pb_code_lower ON ProductBarcodes(lower(trim(code)));
+
+            CREATE TABLE IF NOT EXISTS ProductImages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                product_id INTEGER NOT NULL,
+                rel_path TEXT NOT NULL,
+                original_name TEXT,
+                sort_order INTEGER NOT NULL,
+                is_primary INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (product_id) REFERENCES Products(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_pi_product_id ON ProductImages(product_id);
+            CREATE INDEX IF NOT EXISTS idx_pi_product_sort ON ProductImages(product_id, sort_order);
+            CREATE INDEX IF NOT EXISTS idx_pi_product_primary ON ProductImages(product_id, is_primary);
 
             CREATE TABLE IF NOT EXISTS AdditionalProductCategories (
                 product_id INTEGER NOT NULL,
@@ -771,6 +785,8 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
                 _migration_v3_assembly_requirements(conn)
             elif v == 4:
                 _migration_v4_sale_assembly(conn)
+            elif v == 5:
+                _migration_v5_product_images(conn)
             else:
                 raise RuntimeError(f"Unknown migration step: {v}")
             _set_user_version(conn, v)
@@ -878,6 +894,26 @@ def _migration_v4_sale_assembly(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migration_v5_product_images(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS ProductImages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            product_id INTEGER NOT NULL,
+            rel_path TEXT NOT NULL,
+            original_name TEXT,
+            sort_order INTEGER NOT NULL,
+            is_primary INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (product_id) REFERENCES Products(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_pi_product_id ON ProductImages(product_id);
+        CREATE INDEX IF NOT EXISTS idx_pi_product_sort ON ProductImages(product_id, sort_order);
+        CREATE INDEX IF NOT EXISTS idx_pi_product_primary ON ProductImages(product_id, is_primary);
+        """
+    )
+
+
 def _migration_v1_baseline(conn: sqlite3.Connection) -> None:
     _migrate_schema(conn, commit=False)
     _normalize_existing_codes(conn, use_transaction=False)
@@ -942,6 +978,20 @@ def _migrate_schema(conn: sqlite3.Connection, *, commit: bool = True) -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_pb_product_id ON ProductBarcodes(product_id);
         CREATE INDEX IF NOT EXISTS idx_pb_code_lower ON ProductBarcodes(lower(trim(code)));
+
+        CREATE TABLE IF NOT EXISTS ProductImages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            product_id INTEGER NOT NULL,
+            rel_path TEXT NOT NULL,
+            original_name TEXT,
+            sort_order INTEGER NOT NULL,
+            is_primary INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (product_id) REFERENCES Products(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_pi_product_id ON ProductImages(product_id);
+        CREATE INDEX IF NOT EXISTS idx_pi_product_sort ON ProductImages(product_id, sort_order);
+        CREATE INDEX IF NOT EXISTS idx_pi_product_primary ON ProductImages(product_id, is_primary);
 
         CREATE TABLE IF NOT EXISTS InventoryDocuments (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2351,6 +2401,67 @@ def replace_product_barcodes(product_id: int, codes: list[dict]) -> None:
                     "INSERT INTO ProductBarcodes (product_id, code, note) VALUES (?,?,?)",
                     sanitized,
                 )
+
+
+def list_product_images(product_id: int) -> list[sqlite3.Row]:
+    query = """
+        SELECT id, product_id, rel_path, original_name, sort_order, is_primary, created_at
+        FROM ProductImages
+        WHERE product_id=?
+        ORDER BY sort_order, id
+    """
+    with get_connection() as conn:
+        return list(conn.execute(query, (product_id,)))
+
+
+def get_product_image(image_id: int) -> Optional[sqlite3.Row]:
+    with get_connection() as conn:
+        return conn.execute(
+            """
+            SELECT id, product_id, rel_path, original_name, sort_order, is_primary, created_at
+            FROM ProductImages WHERE id=?
+            """,
+            (image_id,),
+        ).fetchone()
+
+
+def add_product_image(
+    *,
+    product_id: int,
+    rel_path: str,
+    original_name: str | None,
+    sort_order: int,
+    is_primary: bool = False,
+) -> int:
+    with get_connection() as conn:
+        with safe_transaction(conn):
+            if is_primary:
+                conn.execute("UPDATE ProductImages SET is_primary=0 WHERE product_id=?", (product_id,))
+            cur = conn.execute(
+                """
+                INSERT INTO ProductImages (product_id, rel_path, original_name, sort_order, is_primary)
+                VALUES (?,?,?,?,?)
+                """,
+                (product_id, rel_path, original_name, sort_order, 1 if is_primary else 0),
+            )
+        return int(cur.lastrowid)
+
+
+def delete_product_image(image_id: int) -> None:
+    with get_connection() as conn:
+        conn.execute("DELETE FROM ProductImages WHERE id=?", (image_id,))
+        conn.commit()
+
+
+def set_primary_product_image(image_id: int) -> None:
+    with get_connection() as conn:
+        with safe_transaction(conn):
+            row = conn.execute("SELECT product_id FROM ProductImages WHERE id=?", (image_id,)).fetchone()
+            if not row:
+                return
+            product_id = row["product_id"]
+            conn.execute("UPDATE ProductImages SET is_primary=0 WHERE product_id=?", (product_id,))
+            conn.execute("UPDATE ProductImages SET is_primary=1 WHERE id=? AND product_id=?", (image_id, product_id))
 
 
 def find_product_by_scan_code(code: str, barcode_prefix: str = "") -> Optional[sqlite3.Row]:

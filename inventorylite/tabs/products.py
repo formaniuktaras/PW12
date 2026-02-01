@@ -22,6 +22,7 @@ from inventorylite.utils import (
     open_file,
 )
 from inventorylite.dialogs import product_prompt
+from inventorylite.services.product_images_service import ProductImagesService
 from inventorylite.dialogs_stock_moves import open_stock_moves_dialog
 from inventorylite.helpers import (
     PRODUCT_FIELDS,
@@ -184,7 +185,19 @@ class ProductsTab:
         values = product_prompt(brands, categories, "Новий товар", settings=self.settings)
         if not values:
             return
-        sku, supplier_sku_legacy, name, brand_id, category_id, unit, is_active, extras, supplier_codes, barcodes = values
+        (
+            sku,
+            supplier_sku_legacy,
+            name,
+            brand_id,
+            category_id,
+            unit,
+            is_active,
+            extras,
+            supplier_codes,
+            barcodes,
+            image_payload,
+        ) = values
         try:
             effective_supplier_sku = supplier_sku_legacy or (
                 supplier_codes[0]["supplier_sku"] if len(supplier_codes) == 1 else None
@@ -195,8 +208,20 @@ class ProductsTab:
                 db.replace_product_supplier_codes(product_id, supplier_codes)
             if barcodes:
                 db.replace_product_barcodes(product_id, barcodes)
+            images_service = ProductImagesService()
+            created = images_service.apply_pending(image_payload["session_id"], product_id)
+            primary = image_payload.get("primary")
+            if primary:
+                if primary.get("kind") == "existing":
+                    images_service.set_primary(int(primary.get("id")))
+                elif primary.get("kind") == "pending":
+                    filename = primary.get("filename")
+                    match = next((img for img in created if Path(img.rel_path).name == filename), None)
+                    if match:
+                        images_service.set_primary(match.id)
             self.refresh_products()
         except sqlite3.IntegrityError as exc:
+            ProductImagesService().cleanup_pending(image_payload["session_id"])
             if "ProductSupplierCodes" in str(exc):
                 show_error(
                     "Товари",
@@ -207,6 +232,7 @@ class ProductsTab:
             else:
                 show_error("Товари", "SKU або назва вже існує.")
         except Exception:
+            ProductImagesService().cleanup_pending(image_payload["session_id"])
             logging.exception("Add product error")
             show_error("Товари", "Не вдалося додати товар.")
 
@@ -249,17 +275,44 @@ class ProductsTab:
                 barcodes,
             ),
             settings=self.settings,
+            product_id=product_id,
         )
         if not values:
             return
-        sku, supplier_sku_legacy, name, brand_id, category_id, unit, is_active, extras, supplier_codes, barcodes = values
+        (
+            sku,
+            supplier_sku_legacy,
+            name,
+            brand_id,
+            category_id,
+            unit,
+            is_active,
+            extras,
+            supplier_codes,
+            barcodes,
+            image_payload,
+        ) = values
         try:
             db.update_product(product_id, sku, name, brand_id, category_id, unit, is_active, supplier_sku_legacy)
             db.set_product_categories(product_id, category_id, extras)
             db.replace_product_supplier_codes(product_id, supplier_codes)
             db.replace_product_barcodes(product_id, barcodes)
+            images_service = ProductImagesService()
+            for image_id in image_payload.get("deleted_ids", []):
+                images_service.delete_image(int(image_id))
+            created = images_service.apply_pending(image_payload["session_id"], product_id)
+            primary = image_payload.get("primary")
+            if primary:
+                if primary.get("kind") == "existing":
+                    images_service.set_primary(int(primary.get("id")))
+                elif primary.get("kind") == "pending":
+                    filename = primary.get("filename")
+                    match = next((img for img in created if Path(img.rel_path).name == filename), None)
+                    if match:
+                        images_service.set_primary(match.id)
             self.refresh_products()
         except sqlite3.IntegrityError as exc:
+            ProductImagesService().cleanup_pending(image_payload["session_id"])
             if "ProductSupplierCodes" in str(exc):
                 show_error(
                     "Товари",
@@ -270,6 +323,7 @@ class ProductsTab:
             else:
                 show_error("Товари", "SKU або назва вже існує.")
         except Exception:
+            ProductImagesService().cleanup_pending(image_payload["session_id"])
             logging.exception("Edit product error")
             show_error("Товари", "Не вдалося змінити товар.")
 
@@ -282,6 +336,7 @@ class ProductsTab:
             return
         try:
             db.delete_product(product_id)
+            ProductImagesService().delete_product_files(product_id)
             self.refresh_products()
         except Exception:
             logging.exception("Delete product error")
