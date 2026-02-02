@@ -119,15 +119,14 @@ def product_prompt(
     palette = _palette()
 
     photo_frame = right
-    photo_frame.columnconfigure(0, weight=1)
-    photo_frame.rowconfigure(1, weight=1)
+    photo_frame.columnconfigure(0, weight=1, minsize=260)
+    photo_frame.rowconfigure(1, weight=1, minsize=200)
 
     ttk.Label(photo_frame, text="Фото").grid(row=0, column=0, sticky="w", padx=4, pady=(0, 6))
 
     preview_container = tk.Frame(photo_frame, background=palette["surface_alt"], highlightthickness=1)
     preview_container.configure(highlightbackground=palette["border"], highlightcolor=palette["border"])
     preview_container.grid(row=1, column=0, sticky="nsew", padx=4)
-    preview_container.minsize(260, 200)
     preview_container.columnconfigure(0, weight=1)
     preview_container.rowconfigure(0, weight=1)
 
